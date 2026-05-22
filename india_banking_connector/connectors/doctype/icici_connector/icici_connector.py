@@ -3,10 +3,14 @@
 
 import json
 import re
-from base64 import b64encode
+import secrets
+from base64 import b64decode, b64encode
 
 import frappe
 import requests
+from Crypto.Cipher import AES, PKCS1_v1_5 as Cipher_PKCS1_v1_5
+from Crypto.PublicKey import RSA
+from Crypto.Util.Padding import pad, unpad
 from frappe import _
 from frappe.utils import cstr, flt, getdate, nowdate
 
@@ -14,7 +18,6 @@ from india_banking_connector.connectors.bank_connector import BankConnector
 from india_banking_connector.india_banking_connector.doctype.bank_request_log.bank_request_log import (
 	create_api_log,
 )
-from india_banking_connector.utils import get_id
 
 
 class ICICIConnector(BankConnector):
@@ -22,6 +25,13 @@ class ICICIConnector(BankConnector):
 
 	AES_KEY = "1234567887654321".encode("utf-8")
 	IV = "0000000000000000".encode("utf-8")
+	HYBRID_ENCRYPTION_METHODS = {
+		"generate_otp",
+		"make_payment",
+		"payment_status",
+		"bank_balance",
+		"bank_statement",
+	}
 
 	__all__ = ["initiate_payment", "get_payment_status"]
 
@@ -37,24 +47,21 @@ class ICICIConnector(BankConnector):
 		return super().urls
 
 	def headers(self, mode_of_transfer=None, params=None):
-		headers = {
-			"accept": "*/*",
-			"content-type": "text/plain",
+		return {
+			"Accept": "*/*",
+			"Content-Type": "application/Json",
 			"apikey": self.client_key,
-			"host": self.urls.host,
 		}
 
-		if self.bulk_transaction:
-			headers.update(
-				{
-					"content-type": "application/json",
-					"x-priority": self.get_priority(mode_of_transfer),
-				}
-			)
-		if params:
-			headers.update(params)
+	def post_request(self, url, headers, payload):
+		session = requests.Session()
+		session.headers.clear()
+		request = requests.Request("POST", url, headers=headers, data=payload)
+		prepared_request = session.prepare_request(request)
+		for header in ("User-Agent", "Accept-Encoding", "Connection", "Content-Length"):
+			prepared_request.headers.pop(header, None)
 
-		return headers
+		return session.send(prepared_request)
 
 	@frappe.whitelist()
 	def register(self):
@@ -64,7 +71,7 @@ class ICICIConnector(BankConnector):
 		headers = self.headers()
 		payload = self.get_encrypted_payload(method="register")
 
-		response = requests.post(url, headers=headers, data=payload)
+		response = self.post_request(url, headers=headers, payload=payload)
 
 		log_id = create_api_log(
 			response,
@@ -88,7 +95,7 @@ class ICICIConnector(BankConnector):
 		headers = self.headers()
 		payload = self.get_encrypted_payload(method="registration_status")
 
-		response = requests.post(url, headers=headers, data=payload)
+		response = self.post_request(url, headers=headers, payload=payload)
 
 		log_id = create_api_log(
 			response,
@@ -123,7 +130,7 @@ class ICICIConnector(BankConnector):
 		headers = self.headers(payment_details.mode_of_transfer)
 		payload = self.get_encrypted_payload(method="make_payment")
 
-		response = requests.post(url, headers=headers, data=payload)
+		response = self.post_request(url, headers=headers, payload=payload)
 
 		log_id = create_api_log(
 			response,
@@ -152,7 +159,7 @@ class ICICIConnector(BankConnector):
 		headers = self.headers(mode_of_transfer)
 		payload = self.get_encrypted_payload(method="payment_status")
 
-		response = requests.post(url, headers=headers, data=payload)
+		response = self.post_request(url, headers=headers, payload=payload)
 
 		log_id = create_api_log(
 			response,
@@ -176,7 +183,7 @@ class ICICIConnector(BankConnector):
 		headers = self.headers(payment_details.mode_of_transfer)
 		payload = self.get_encrypted_payload(method="generate_otp")
 
-		response = requests.post(url, headers=headers, data=payload)
+		response = self.post_request(url, headers=headers, payload=payload)
 
 		log_id = create_api_log(
 			response,
@@ -200,27 +207,105 @@ class ICICIConnector(BankConnector):
 		payment_details = self.payment_doc if not self.bulk_transaction else self.doc
 
 		data = self.get_account_config(method)
+		public_key_path = self.get_file_relative_path(connector_doc.public_key)
 
-		if self.bulk_transaction and (method not in ["bank_balance", "bank_statement"]):
-			encrypted_key = self.rsa_encrypt_key(
-				self.AES_KEY, self.get_file_relative_path(connector_doc.public_key)
+		if method in self.HYBRID_ENCRYPTION_METHODS or (
+			self.bulk_transaction and method not in ["bank_balance", "bank_statement"]
+		):
+			return self.get_hybrid_encrypted_payload(
+				data, public_key_path, payment_details
 			)
 
-			return json.dumps(
-				{
-					"requestId": get_id(10, payment_details.name),
-					"service": "",
-					"oaepHashingAlgorithm": "NONE",
-					"encryptedKey": encrypted_key,
-					"encryptedData": self.aes_encrypt_data(data, self.AES_KEY),
-					"clientInfo": "",
-					"optionalParam": "",
-					"iv": b64encode(self.IV).decode("utf-8"),
-				}
+		return self.rsa_encrypt_data(data, public_key_path)
+
+	def get_hybrid_encrypted_payload(self, data, public_key_path, payment_details):
+		random_key = self.generate_16_digit_random_number()
+		random_iv = self.generate_16_digit_random_number()
+		encrypted_key = self.icici_rsa_encrypt(random_key, public_key_path)
+		encrypted_data = self.icici_aes_encrypt_data(
+			data=data, key=random_key, iv=random_iv
+		)
+
+		return json.dumps(
+			{
+				"requestId": "",
+				"service": "",
+				"encryptedKey": encrypted_key,
+				"oaepHashingAlgorithm": "NONE",
+				"iv": "",
+				"encryptedData": encrypted_data,
+				"clientInfo": "",
+				"optionalParam": "",
+			},
+			separators=(",", ":"),
+		)
+
+	def generate_request_id(self):
+		return "".join(
+			secrets.choice("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ") for _ in range(10)
+		)
+
+	def generate_16_digit_random_number(self):
+		return "".join(secrets.choice("0123456789") for _ in range(16))
+
+	def icici_rsa_encrypt(self, data, key_path):
+		if isinstance(data, str):
+			data = data.encode("utf-8")
+
+		with open(key_path, "rb") as file:
+			rsa_key = RSA.import_key(file.read())
+
+		cipher = Cipher_PKCS1_v1_5.new(rsa_key)
+		return b64encode(cipher.encrypt(data)).decode("utf-8")
+
+	def icici_rsa_decrypt(self, data, key_path):
+		with open(key_path, "rb") as file:
+			rsa_key = RSA.import_key(file.read())
+
+		cipher = Cipher_PKCS1_v1_5.new(rsa_key)
+		decrypted = cipher.decrypt(b64decode(data), None)
+		if decrypted is None:
+			frappe.throw(_("Failed to decrypt ICICI encrypted key."))
+
+		return decrypted.decode("utf-8")
+
+	def icici_aes_encrypt_data(self, data, key, iv):
+		if isinstance(data, dict):
+			data = json.dumps(data, separators=(",", ":"))
+
+		key = key.encode("utf-8") if isinstance(key, str) else key
+		iv = iv.encode("utf-8") if isinstance(iv, str) else iv
+		plain_text = data.encode("utf-8")
+		cipher = AES.new(key, AES.MODE_CBC, iv)
+		encrypted_data = cipher.encrypt(pad(plain_text, AES.block_size))
+
+		return b64encode(iv + encrypted_data).decode("utf-8")
+
+	def icici_aes_decrypt_data(self, data, key, json_loads=True):
+		key = key.encode("utf-8") if isinstance(key, str) else key
+		encrypted_bytes = b64decode(data)
+		decryption_errors = []
+
+		decryption_attempts = []
+		if len(encrypted_bytes) > AES.block_size:
+			decryption_attempts.append(
+				(encrypted_bytes[: AES.block_size], encrypted_bytes[AES.block_size :])
 			)
-		else:
-			public_key_path = self.get_file_relative_path(connector_doc.public_key)
-			return self.rsa_encrypt_data(data, public_key_path)
+		decryption_attempts.append((self.IV, encrypted_bytes))
+
+		for iv, encrypted_data in decryption_attempts:
+			try:
+				cipher = AES.new(key, AES.MODE_CBC, iv)
+				decrypted_data = unpad(cipher.decrypt(encrypted_data), AES.block_size)
+				if decrypted_data[: AES.block_size] == iv:
+					decrypted_data = decrypted_data[AES.block_size :]
+				decrypted_text = decrypted_data.decode("utf-8")
+				return json.loads(decrypted_text) if json_loads else decrypted_text
+			except Exception as e:
+				decryption_errors.append(e)
+
+		frappe.log_error("Connector Error", frappe.get_traceback(with_context=True))
+		frappe.throw(title="Decryption Failed", msg=decryption_errors[0])
 
 	def get_account_config(self, method):
 		payment_details = self.payment_doc if not self.bulk_transaction else self.doc
@@ -248,12 +333,12 @@ class ICICIConnector(BankConnector):
 		connector_doc = self
 		data.update(
 			{
-				"AGGRNAME": connector_doc.aggr_name,
-				"AGGRID": connector_doc.aggr_id,
-				"CORPID": connector_doc.corp_id,
-				"USERID": connector_doc.corp_usr,
-				"URN": connector_doc.urn,
-				"ALIASID": "",
+				"AGGRNAME":connector_doc.aggr_name,
+				"AGGRID":connector_doc.aggr_id,
+				"CORPID":connector_doc.corp_id,
+				"USERID":connector_doc.corp_usr,
+				"URN":connector_doc.urn,
+				"ALIASID":"",
 			}
 		)
 
@@ -261,11 +346,11 @@ class ICICIConnector(BankConnector):
 		connector_doc = self
 		data.update(
 			{
-				"AGGRNAME": connector_doc.aggr_name,
-				"AGGRID": connector_doc.aggr_id,
-				"CORPID": connector_doc.corp_id,
-				"USERID": connector_doc.corp_usr,
-				"URN": connector_doc.urn,
+				"AGGRNAME":connector_doc.aggr_name,
+				"AGGRID":connector_doc.aggr_id,
+				"CORPID":connector_doc.corp_id,
+				"USERID":connector_doc.corp_usr,
+				"URN":connector_doc.urn,
 			}
 		)
 
@@ -278,13 +363,13 @@ class ICICIConnector(BankConnector):
 
 		data.update(
 			{
-				"AGGRID": connector_doc.aggr_id,
-				"CORPID": connector_doc.corp_id,
-				"USERID": connector_doc.statement_corp_usr,
-				"URN": connector_doc.urn,
-				"FROMDATE": from_date,
-				"TODATE": to_date,
-				"ACCOUNTNO": connector_doc.account_number,
+				"AGGRID":connector_doc.aggr_id,
+				"CORPID":connector_doc.corp_id,
+				"USERID":connector_doc.statement_corp_usr,
+				"URN":connector_doc.urn,
+				"FROMDATE":from_date,
+				"TODATE":to_date,
+				"ACCOUNTNO":connector_doc.account_number,
 			}
 		)
 		if payload_details.get("paginated"):
@@ -299,11 +384,11 @@ class ICICIConnector(BankConnector):
 
 		data.update(
 			{
-				"AGGRID": connector_doc.aggr_id,
-				"CORPID": connector_doc.corp_id,
-				"USERID": connector_doc.balance_corp_usr,
-				"URN": connector_doc.urn,
-				"ACCOUNTNO": connector_doc.account_number,
+				"AGGRID":connector_doc.aggr_id,
+				"CORPID":connector_doc.corp_id,
+				"USERID":connector_doc.balance_corp_usr,
+				"URN":connector_doc.urn,
+				"ACCOUNTNO":connector_doc.account_number,
 			}
 		)
 
@@ -312,16 +397,23 @@ class ICICIConnector(BankConnector):
 		payment_details = self.payment_doc if not self.bulk_transaction else self.doc
 
 		unique_id = "".join(re.findall(r"[0-9a-zA-Z]", payment_details.name))[-10:]
+		if not self.bulk_transaction:
+			unique_id = payment_details.name
+
+		data.update(
+			{
+				"CORPID":connector_doc.corp_id,
+				"USERID":connector_doc.corp_usr,
+				"AGGRID":connector_doc.aggr_id,
+				"AGGRNAME":connector_doc.aggr_name,
+				"URN":connector_doc.urn,
+				"UNIQUEID":unique_id,
+			}
+		)
 
 		if self.bulk_transaction:
 			data.update(
 				{
-					"CORPID": connector_doc.corp_id,
-					"USERID": connector_doc.corp_usr,
-					"AGGRID": connector_doc.aggr_id,
-					"AGGRNAME": connector_doc.aggr_name,
-					"URN": connector_doc.urn,
-					"UNIQUEID": unique_id,
 					"AMOUNT": str(payment_details.total),
 				}
 			)
@@ -389,9 +481,14 @@ class ICICIConnector(BankConnector):
 						payment_details.bank,
 						mode_of_transfer=payment_details.mode_of_transfer,
 					),
+					"OTP": str(payment_details.get("otp") or ""),
 					"PAYEENAME": self.clean_string(payment_details.account_name),
-					"REMARKS": f"{payment_details.party_type} {self.clean_string(payment_details.party)}",
+					"REMARKS": (
+						f"{payment_details.party_type} "
+						f"{self.clean_string(payment_details.party)}"
+					),
 					"WORKFLOW_REQD": workflow_reqd,
+					"CUSTOMERINDUCED": payment_details.get("customer_induced") or "",
 					"BENLEI": payment_details.lei or "",
 				}
 			)
@@ -432,27 +529,10 @@ class ICICIConnector(BankConnector):
 		if response.ok:
 			response = response.text
 
-			if self.bulk_transaction and method not in [
-				"bank_balance",
-				"bank_statement",
-			]:
-				response = json.loads(response)
-				decrypted_key = self.rsa_decrypt_key(
-					response.get("encryptedKey"),
-					self.get_file_relative_path(connector_doc.private_key),
-				)
-				decrypted_data = self.aes_decrypt_data(
-					response.get("encryptedData"), decrypted_key
-				)
-
-			elif method == "bank_statement":
-				response = json.loads(response)
-				decrypted_key = self.rsa_decrypt_key(
-					response.get("encryptedKey"),
-					self.get_file_relative_path(connector_doc.private_key),
-				)
-				decrypted_data = self.rsa_with_aes_decrypt_data(
-					response.get("encryptedData"), decrypted_key
+			response_json = self.get_response_json(response)
+			if response_json and self.has_hybrid_encrypted_response(response_json):
+				decrypted_data = self.decrypt_hybrid_response(
+					response_json, self.get_file_relative_path(connector_doc.private_key)
 				)
 			else:
 				decrypted_data = self.rsa_decrypt_data(
@@ -467,6 +547,40 @@ class ICICIConnector(BankConnector):
 			res_dict.message = response.text or response.status_code
 
 		return res_dict
+
+	def get_response_json(self, response):
+		try:
+			return json.loads(response)
+		except Exception:
+			return None
+
+	def has_hybrid_encrypted_response(self, response):
+		return self.get_encrypted_key(response) and self.get_encrypted_data(response)
+
+	def decrypt_hybrid_response(self, response, private_key_path):
+		decrypted_key = self.icici_rsa_decrypt(
+			self.get_encrypted_key(response), private_key_path
+		)
+
+		return self.icici_aes_decrypt_data(
+			self.get_encrypted_data(response), decrypted_key
+		)
+
+	def get_encrypted_key(self, data):
+		return (
+			data.get("encryptedKey")
+			or data.get("ENCR_KEY")
+			or data.get("encrypted_key")
+			or data.get("encr_key")
+		)
+
+	def get_encrypted_data(self, data):
+		return (
+			data.get("encryptedData")
+			or data.get("ENCR_DATA")
+			or data.get("encrypted_data")
+			or data.get("encr_data")
+		)
 
 	def get_formated_response(self, data, res_dict, method):
 		if isinstance(data, str):
@@ -695,10 +809,10 @@ class ICICIConnector(BankConnector):
 
 		self.update_client_details("bank_balance")
 		url = self.urls.bank_balance
-		headers = self.headers(params={"content-type": "text/plain"})
+		headers = self.headers()
 		payload = self.get_encrypted_payload(method="bank_balance")
 
-		response = requests.post(url, headers=headers, data=payload)
+		response = self.post_request(url, headers=headers, payload=payload)
 
 		log_id = create_api_log(
 			response,
@@ -719,10 +833,10 @@ class ICICIConnector(BankConnector):
 
 		self.update_client_details("bank_statement")
 		url = self.urls.bank_statement
-		headers = self.headers(params={"content-type": "text/plain"})
+		headers = self.headers()
 		payload = self.get_encrypted_payload(method="bank_statement")
 
-		response = requests.post(url, headers=headers, data=payload)
+		response = self.post_request(url, headers=headers, payload=payload)
 
 		log_id = create_api_log(
 			response,

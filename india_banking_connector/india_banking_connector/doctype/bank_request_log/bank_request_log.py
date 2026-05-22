@@ -95,6 +95,24 @@ def format_with_indent(data):
 	return data
 
 
+def format_compact_json(data):
+	try:
+		if not data:
+			return ""
+		if isinstance(data, CaseInsensitiveDict):
+			data = dict(data)
+		if isinstance(data, dict):
+			return json.dumps(data, separators=(",", ":"))
+		if (data := data.strip()) and data.startswith("{") and data.endswith("}"):
+			return json.dumps(json.loads(data), separators=(",", ":"))
+	except Exception:
+		frappe.log_error(
+			title="Error in compacting JSON data",
+			message=frappe.get_traceback(with_context=True),
+		)
+	return data
+
+
 def encrypt_log(data, encrypt_data=False):
 	if not encrypt_data:
 		return data
@@ -138,9 +156,10 @@ def create_api_log(
 		log_doc.method = res.request.method
 		log_doc.header = encrypt_log(format_with_indent(res.request.headers), _encrypt)
 		log_doc.response = encrypt_log(format_with_indent(res.text), _encrypt)
-		log_doc.config_details = encrypt_log(
-			format_with_indent(account_config), _encrypt
-		)
+		config_details = format_with_indent(account_config)
+		if (connector or {}).get("doctype") == "ICICI Connector":
+			config_details = format_compact_json(account_config)
+		log_doc.config_details = encrypt_log(config_details, _encrypt)
 		log_doc.status_code = res.status_code
 		log_doc.reference_doctype = ref_doctype
 		log_doc.reference_docname = ref_docname
