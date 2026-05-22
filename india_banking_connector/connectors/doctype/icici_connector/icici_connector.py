@@ -119,7 +119,7 @@ class ICICIConnector(BankConnector):
 		payment_details = self.payment_doc if not self.bulk_transaction else self.doc
 		unique_id = "".join(re.findall(r"[0-9a-zA-Z]", payment_details.name))[-10:]
 		if not self.bulk_transaction:
-			unique_id = payment_details.name
+			unique_id = "".join(re.findall(r"[0-9a-zA-Z]", payment_details.name))
 
 		if existing_payment_response := self.validate_duplicate_payments(
 			unique_id=unique_id
@@ -151,7 +151,7 @@ class ICICIConnector(BankConnector):
 		payment_details = self.payment_doc if not self.bulk_transaction else self.doc
 		unique_id = "".join(re.findall(r"[0-9a-zA-Z]", payment_details.name))[-10:]
 		if not self.bulk_transaction:
-			unique_id = payment_details.name
+			unique_id = "".join(re.findall(r"[0-9a-zA-Z]", payment_details.name))
 
 		mode_of_transfer = payment_details.mode_of_transfer
 
@@ -180,17 +180,22 @@ class ICICIConnector(BankConnector):
 		payment_details = self.payment_doc if not self.bulk_transaction else self.doc
 
 		url = self.urls.generate_otp
-		headers = self.headers(payment_details.mode_of_transfer)
+		headers = self.headers(
+			payment_details.get("mode_of_transfer") or self.doc.get("default_mode_of_transfer")
+		)
 		payload = self.get_encrypted_payload(method="generate_otp")
 
 		response = self.post_request(url, headers=headers, payload=payload)
+
+		ref_doctype = payment_details.parenttype or payment_details.doctype or self.doc.get("doctype")
+		ref_docname = payment_details.parent or payment_details.name or self.doc.get("name")
 
 		log_id = create_api_log(
 			response,
 			action="Generate OTP",
 			account_config=self.get_account_config("generate_otp"),
-			ref_doctype=payment_details.parenttype or payment_details.doctype,
-			ref_docname=payment_details.parent or payment_details.name,
+			ref_doctype=ref_doctype,
+			ref_docname=ref_docname,
 			connector=self,
 		)
 
@@ -220,15 +225,14 @@ class ICICIConnector(BankConnector):
 
 	def get_hybrid_encrypted_payload(self, data, public_key_path, payment_details):
 		random_key = self.generate_16_digit_random_number()
-		random_iv = self.generate_16_digit_random_number()
 		encrypted_key = self.icici_rsa_encrypt(random_key, public_key_path)
 		encrypted_data = self.icici_aes_encrypt_data(
-			data=data, key=random_key, iv=random_iv
+			data=data, key=random_key, iv=random_key
 		)
 
 		return json.dumps(
 			{
-				"requestId": "",
+				"requestId": self.generate_request_id(),
 				"service": "",
 				"encryptedKey": encrypted_key,
 				"oaepHashingAlgorithm": "NONE",
@@ -396,9 +400,12 @@ class ICICIConnector(BankConnector):
 		connector_doc = self
 		payment_details = self.payment_doc if not self.bulk_transaction else self.doc
 
-		unique_id = "".join(re.findall(r"[0-9a-zA-Z]", payment_details.name))[-10:]
-		if not self.bulk_transaction:
-			unique_id = payment_details.name
+		if self.bulk_transaction:
+			unique_id = "".join(re.findall(r"[0-9a-zA-Z]", payment_details.name))[-10:]
+		else:
+			# For non-bulk, payment_details is the full API payload dict;
+			# use self.doc.name (Payment Order name) as the unique ID
+			unique_id = "".join(re.findall(r"[0-9a-zA-Z]", self.doc.name))
 
 		data.update(
 			{
@@ -469,7 +476,7 @@ class ICICIConnector(BankConnector):
 					"CORPID": connector_doc.corp_id,
 					"USERID": connector_doc.corp_usr,
 					"URN": connector_doc.urn,
-					"UNIQUEID": payment_details.name,
+					"UNIQUEID": "".join(re.findall(r"[0-9a-zA-Z]", payment_details.name)),
 					"DEBITACC": connector_doc.account_number,
 					"CREDITACC": payment_details.bank_account_no,
 					"IFSC": connector_doc.ifsc_code or "ICIC0000011"
@@ -519,7 +526,7 @@ class ICICIConnector(BankConnector):
 				"CORPID": connector_doc.corp_id,
 				"USERID": connector_doc.corp_usr,
 				"URN": connector_doc.urn,
-				"UNIQUEID": payment_details.name,
+				"UNIQUEID": "".join(re.findall(r"[0-9a-zA-Z]", payment_details.name)),
 			}
 		)
 
@@ -534,6 +541,9 @@ class ICICIConnector(BankConnector):
 				decrypted_data = self.decrypt_hybrid_response(
 					response_json, self.get_file_relative_path(connector_doc.private_key)
 				)
+			elif response_json:
+				# Plain JSON response (e.g., error response from gateway)
+				decrypted_data = response_json
 			else:
 				decrypted_data = self.rsa_decrypt_data(
 					response, self.get_file_relative_path(connector_doc.private_key)
@@ -609,6 +619,19 @@ class ICICIConnector(BankConnector):
 			else:
 				res_dict.status = "Failed"
 				res_dict.message = data.get("errormessage") or data.get("Message")
+
+		elif method == "generate_otp" and data:
+			if data.get("RESPONSE") == "Success":
+				res_dict.status = "success"
+				res_dict.message = data.get("Message") or data.get("MESSAGE")
+			else:
+				res_dict.status = "Failed"
+				err_msg = None
+				if data.get("ErrorCode"):
+					err_msg = self.get_error_description(data.get("ErrorCode"))
+				res_dict.message = (
+					err_msg or data.get("errormessage") or data.get("Message")
+				)
 
 		elif method == "make_payment" and data:
 			if data.STATUS in [
