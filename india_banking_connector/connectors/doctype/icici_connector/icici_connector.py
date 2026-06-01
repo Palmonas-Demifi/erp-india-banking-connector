@@ -403,9 +403,14 @@ class ICICIConnector(BankConnector):
 		if self.bulk_transaction:
 			unique_id = "".join(re.findall(r"[0-9a-zA-Z]", payment_details.name))[-10:]
 		else:
-			# For non-bulk, payment_details is the full API payload dict;
-			# use self.doc.name (Payment Order name) as the unique ID
-			unique_id = "".join(re.findall(r"[0-9a-zA-Z]", self.doc.name))
+			# Generate a fresh random UNIQUEID for each OTP request
+			# and cache it so TransactionOTP can use the same value
+			unique_id = "".join(
+				secrets.choice("0123456789abcdefghijklmnopqrstuvwxyz") for _ in range(16)
+			)
+			frappe.cache().set_value(
+				f"icici_otp_uniqueid_{self.doc.name}", unique_id, expires_in_sec=300
+			)
 
 		data.update(
 			{
@@ -471,32 +476,31 @@ class ICICIConnector(BankConnector):
 
 			data.update(
 				{
-					"AGGRID": connector_doc.aggr_id,
-					"AGGRNAME": connector_doc.aggr_name,
 					"CORPID": connector_doc.corp_id,
 					"USERID": connector_doc.corp_usr,
+					"AGGRID": connector_doc.aggr_id,
 					"URN": connector_doc.urn,
-					"UNIQUEID": "".join(re.findall(r"[0-9a-zA-Z]", payment_details.name)),
+					"UNIQUEID": frappe.cache().get_value(f"icici_otp_uniqueid_{self.doc.name}") or "".join(re.findall(r"[0-9a-zA-Z]", self.doc.name)),
+					"AMOUNT": cstr(payment_details.amount),
+					"AGGRNAME": connector_doc.aggr_name,
 					"DEBITACC": connector_doc.account_number,
 					"CREDITACC": payment_details.bank_account_no,
 					"IFSC": connector_doc.ifsc_code or "ICIC0000011"
 					if payment_details.bank == "ICICI Bank"
 					else payment_details.branch_code,
-					"AMOUNT": cstr(payment_details.amount),
 					"CURRENCY": "INR",
 					"TXNTYPE": self.get_transaction_type(
 						payment_details.bank,
 						mode_of_transfer=payment_details.mode_of_transfer,
 					),
-					"OTP": str(payment_details.get("otp") or ""),
+					"OTP": str(payment_details.get("otp") or frappe._dict(payment_details.get("doc", {})).get("otp") or ""),
 					"PAYEENAME": self.clean_string(payment_details.account_name),
 					"REMARKS": (
 						f"{payment_details.party_type} "
 						f"{self.clean_string(payment_details.party)}"
 					),
 					"WORKFLOW_REQD": workflow_reqd,
-					"CUSTOMERINDUCED": payment_details.get("customer_induced") or "",
-					"BENLEI": payment_details.lei or "",
+					"CUSTOMERINDUCED": "Y",
 				}
 			)
 
