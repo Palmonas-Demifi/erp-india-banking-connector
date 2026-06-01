@@ -409,7 +409,7 @@ class ICICIConnector(BankConnector):
 				secrets.choice("0123456789abcdefghijklmnopqrstuvwxyz") for _ in range(16)
 			)
 			frappe.cache().set_value(
-				f"icici_otp_uniqueid_{self.doc.name}", unique_id, expires_in_sec=300
+				f"icici_otp_uniqueid_{payment_details.name}", unique_id, expires_in_sec=300
 			)
 
 		data.update(
@@ -480,7 +480,7 @@ class ICICIConnector(BankConnector):
 					"USERID": connector_doc.corp_usr,
 					"AGGRID": connector_doc.aggr_id,
 					"URN": connector_doc.urn,
-					"UNIQUEID": frappe.cache().get_value(f"icici_otp_uniqueid_{self.doc.name}") or "".join(re.findall(r"[0-9a-zA-Z]", self.doc.name)),
+					"UNIQUEID": frappe.cache().get_value(f"icici_otp_uniqueid_{payment_details.name}") or "".join(re.findall(r"[0-9a-zA-Z]", payment_details.name)),
 					"AMOUNT": cstr(payment_details.amount),
 					"AGGRNAME": connector_doc.aggr_name,
 					"DEBITACC": connector_doc.account_number,
@@ -524,13 +524,42 @@ class ICICIConnector(BankConnector):
 			)
 			return
 
+		original_unique_id = "".join(re.findall(r"[0-9a-zA-Z]", payment_details.name))
+
+		initiation_logs = frappe.get_all(
+			"Bank Request Log",
+			filters={
+				"unique_id": original_unique_id,
+				"action": "Initiate Payment",
+			},
+			order_by="creation desc",
+			limit=1
+		)
+
+		if initiation_logs:
+			try:
+				initiation_log = frappe.get_doc("Bank Request Log", initiation_logs[0].name)
+				if initiation_log.config_details:
+					config_details = initiation_log.decrypt_data(initiation_log.config_details)
+					if isinstance(config_details, str):
+						config_dict = json.loads(config_details)
+					elif isinstance(config_details, dict):
+						config_dict = config_details
+					else:
+						config_dict = {}
+
+					if isinstance(config_dict, dict) and config_dict.get("UNIQUEID"):
+						original_unique_id = config_dict.get("UNIQUEID")
+			except Exception:
+				pass
+
 		data.update(
 			{
 				"AGGRID": connector_doc.aggr_id,
 				"CORPID": connector_doc.corp_id,
 				"USERID": connector_doc.corp_usr,
 				"URN": connector_doc.urn,
-				"UNIQUEID": "".join(re.findall(r"[0-9a-zA-Z]", payment_details.name)),
+				"UNIQUEID": original_unique_id,
 			}
 		)
 
