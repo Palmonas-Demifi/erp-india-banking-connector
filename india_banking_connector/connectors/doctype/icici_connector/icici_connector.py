@@ -666,7 +666,15 @@ class ICICIConnector(BankConnector):
 				res_dict.message = f"{data.errorCode} : {data.description}"
 			else:
 				res_dict.payment_status = "FAILED"
-				res_dict.message = f"Invalid Status : {data.STATUS}"
+				err_msg = ""
+				if data.get("ERRORCODE") or data.get("ErrorCode"):
+					err_msg = self.get_error_description(data.get("ERRORCODE") or data.get("ErrorCode"))
+				
+				res_message = err_msg or data.get("MESSAGE") or data.get("errormessage") or data.get("Message")
+				if res_message:
+					res_dict.message = f"{data.STATUS.title()} : {res_message}"
+				else:
+					res_dict.message = f"Invalid Status : {data.STATUS}"
 
 		elif method == "payment_status" and data:
 			if data.STATUS == "SUCCESS":

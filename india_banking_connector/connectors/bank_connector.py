@@ -86,25 +86,26 @@ class BankConnector(Document):
         if not unique_id:
             return
 
-        bank_request_log = frappe.db.exists(
+        bank_request_logs = frappe.get_all(
             "Bank Request Log",
-            {
+            filters={
                 "unique_id": unique_id,
                 "action": "Initiate Payment",
                 "status_code": "200",
             },
+            order_by="creation desc"
         )
 
-        # If no success payment found, return None
-        if not bank_request_log:
-            return None
+        for log in bank_request_logs:
+            bank_request_log = frappe.get_doc("Bank Request Log", log.name)
+            res_dict = self.get_existing_payment_response(
+                bank_request_log, unique_id, method=method
+            )
+            
+            if res_dict and res_dict.get("payment_status") not in ["FAILED", "Request Failure"]:
+                return res_dict
 
-        bank_request_log = frappe.get_doc("Bank Request Log", bank_request_log)
-
-        # Get existing success payment response
-        return self.get_existing_payment_response(
-            bank_request_log, unique_id, method=method
-        )
+        return None
 
     def get_existing_payment_response(
         self, bank_request_log, unique_id, method="make_payment"
