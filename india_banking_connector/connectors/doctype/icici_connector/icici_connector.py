@@ -399,6 +399,30 @@ class ICICIConnector(BankConnector):
 	def _otp_unique_id_cache_key(self, payment_name):
 		return f"icici_otp_uniqueid_{payment_name}"
 
+	def _otp_session_key(self, payment_details):
+		"""Cache key shared by generate_otp and make_payment for one ICICI payment.
+
+		generate_otp is called with a Payment Order payload (``doc.name`` only).
+		make_payment merges a Payment Order Summary row (``name`` = summary id,
+		``parent`` = order name). Without normalising, OTP and payment look up
+		different cache keys and UNIQUEID never matches.
+		"""
+		if self.bulk_transaction:
+			return payment_details.name
+
+		if (
+			payment_details.get("parenttype") == "Payment Order"
+			and payment_details.get("parent")
+		):
+			return payment_details.parent
+
+		doc = payment_details.get("doc") or {}
+		order_name = doc.get("name") if isinstance(doc, dict) else getattr(doc, "name", None)
+		if order_name:
+			return order_name
+
+		return payment_details.get("name")
+
 	def regenerate_otp_unique_id(self, payment_name):
 		"""Mint and store a fresh UNIQUEID for an OTP request.
 
@@ -427,7 +451,9 @@ class ICICIConnector(BankConnector):
 			# Every OTP request mints a fresh UNIQUEID and stores it, so the
 			# matching payment sends the SAME id. Re-initiating OTP for the same
 			# payment order overwrites it -> a new id for that OTP and its payment.
-			unique_id = self.regenerate_otp_unique_id(payment_details.name)
+			unique_id = self.regenerate_otp_unique_id(
+				self._otp_session_key(payment_details)
+			)
 
 		data.update(
 			{
@@ -494,13 +520,14 @@ class ICICIConnector(BankConnector):
 			# The payment MUST carry the same UNIQUEID minted at the OTP request,
 			# otherwise ICICI rejects the OTP. No silent fallback -- if the OTP
 			# session is gone, ask the user to regenerate it.
-			otp_unique_id = self.get_otp_unique_id(payment_details.name)
+			otp_session_key = self._otp_session_key(payment_details)
+			otp_unique_id = self.get_otp_unique_id(otp_session_key)
 			if not otp_unique_id:
 				frappe.throw(
 					_(
-						"No active OTP session for {0}. Please generate the OTP again "
-						"before initiating the payment."
-					).format(payment_details.name)
+						"No active OTP session for Payment Order {0}. Please generate "
+						"the OTP again before initiating the payment."
+					).format(otp_session_key)
 				)
 
 			data.update(
