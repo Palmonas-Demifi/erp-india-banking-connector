@@ -396,6 +396,27 @@ class ICICIConnector(BankConnector):
 			}
 		)
 
+	def _otp_unique_id_cache_key(self, payment_name):
+		return f"icici_otp_uniqueid_{payment_name}"
+
+	def regenerate_otp_unique_id(self, payment_name):
+		"""Mint and store a fresh UNIQUEID for an OTP request.
+
+		Stored for 30 min so the matching payment reuses the SAME id. Called on
+		every OTP request, so re-initiating OTP for the same payment order yields
+		a new id used for that OTP and its payment."""
+		unique_id = "".join(
+			secrets.choice("0123456789abcdefghijklmnopqrstuvwxyz") for _ in range(16)
+		)
+		frappe.cache().set_value(
+			self._otp_unique_id_cache_key(payment_name), unique_id, expires_in_sec=1800
+		)
+		return unique_id
+
+	def get_otp_unique_id(self, payment_name):
+		"""The UNIQUEID minted at the most recent OTP request for this payment order."""
+		return frappe.cache().get_value(self._otp_unique_id_cache_key(payment_name))
+
 	def set_otp_data(self, data):
 		connector_doc = self
 		payment_details = self.payment_doc if not self.bulk_transaction else self.doc
@@ -403,14 +424,10 @@ class ICICIConnector(BankConnector):
 		if self.bulk_transaction:
 			unique_id = "".join(re.findall(r"[0-9a-zA-Z]", payment_details.name))[-10:]
 		else:
-			# Generate a fresh random UNIQUEID for each OTP request
-			# and cache it so TransactionOTP can use the same value
-			unique_id = "".join(
-				secrets.choice("0123456789abcdefghijklmnopqrstuvwxyz") for _ in range(16)
-			)
-			frappe.cache().set_value(
-				f"icici_otp_uniqueid_{payment_details.name}", unique_id, expires_in_sec=300
-			)
+			# Every OTP request mints a fresh UNIQUEID and stores it, so the
+			# matching payment sends the SAME id. Re-initiating OTP for the same
+			# payment order overwrites it -> a new id for that OTP and its payment.
+			unique_id = self.regenerate_otp_unique_id(payment_details.name)
 
 		data.update(
 			{
@@ -474,13 +491,25 @@ class ICICIConnector(BankConnector):
 			if not self.testing:
 				workflow_reqd = "Y"
 
+			# The payment MUST carry the same UNIQUEID minted at the OTP request,
+			# otherwise ICICI rejects the OTP. No silent fallback -- if the OTP
+			# session is gone, ask the user to regenerate it.
+			otp_unique_id = self.get_otp_unique_id(payment_details.name)
+			if not otp_unique_id:
+				frappe.throw(
+					_(
+						"No active OTP session for {0}. Please generate the OTP again "
+						"before initiating the payment."
+					).format(payment_details.name)
+				)
+
 			data.update(
 				{
 					"CORPID": connector_doc.corp_id,
 					"USERID": connector_doc.corp_usr,
 					"AGGRID": connector_doc.aggr_id,
 					"URN": connector_doc.urn,
-					"UNIQUEID": frappe.cache().get_value(f"icici_otp_uniqueid_{payment_details.name}") or "".join(re.findall(r"[0-9a-zA-Z]", payment_details.name)),
+					"UNIQUEID": otp_unique_id,
 					"AMOUNT": cstr(payment_details.amount),
 					"AGGRNAME": connector_doc.aggr_name,
 					"DEBITACC": connector_doc.account_number,
