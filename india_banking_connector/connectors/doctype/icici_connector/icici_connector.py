@@ -118,13 +118,7 @@ class ICICIConnector(BankConnector):
 	def initiate_payment(self):
 		self.update_client_details("make_payment")
 		payment_details = self.payment_doc if not self.bulk_transaction else self.doc
-		if self.bulk_transaction:
-			unique_id = "".join(re.findall(r"[0-9a-zA-Z]", payment_details.name))[-10:]
-		else:
-			unique_id = (
-				self._get_persisted_otp_unique_id(self._otp_session_key(payment_details))
-				or "".join(re.findall(r"[0-9a-zA-Z]", payment_details.name))
-			)
+		unique_id = self._resolve_icici_unique_id(payment_details, required=True)
 
 		if existing_payment_response := self.validate_duplicate_payments(
 			unique_id=unique_id
@@ -157,22 +151,23 @@ class ICICIConnector(BankConnector):
 	def get_payment_status(self):
 		self.update_client_details("payment_status")
 		payment_details = self.payment_doc if not self.bulk_transaction else self.doc
-		unique_id = "".join(re.findall(r"[0-9a-zA-Z]", payment_details.name))[-10:]
-		if not self.bulk_transaction:
-			unique_id = "".join(re.findall(r"[0-9a-zA-Z]", payment_details.name))
+		unique_id = self._resolve_icici_unique_id(payment_details)
 
 		mode_of_transfer = payment_details.mode_of_transfer
 
 		url = self.urls.payment_status
 		headers = self.headers(mode_of_transfer)
-		payload = self.get_encrypted_payload(method="payment_status")
+		account_config = self.get_account_config("payment_status")
+		payload = self.get_encrypted_payload(
+			method="payment_status", account_config=account_config
+		)
 
 		response = self.post_request(url, headers=headers, payload=payload)
 
 		log_id = create_api_log(
 			response,
 			action="Payment Status",
-			account_config=self.get_account_config("payment_status"),
+			account_config=account_config,
 			ref_doctype=payment_details.parenttype or payment_details.doctype,
 			ref_docname=payment_details.parent or payment_details.name,
 			unique_id=unique_id,
@@ -479,6 +474,64 @@ class ICICIConnector(BankConnector):
 		self._persist_otp_unique_id(payment_order_name, unique_id)
 		return unique_id
 
+	def _unique_id_from_initiation_log(self, payment_order_name):
+		logs = frappe.get_all(
+			"Bank Request Log",
+			filters={
+				"action": "Initiate Payment",
+				"reference_doctype": "Payment Order",
+				"reference_docname": payment_order_name,
+			},
+			fields=["name", "unique_id", "config_details"],
+			order_by="creation desc",
+			limit=1,
+		)
+		if not logs:
+			return None
+
+		log = logs[0]
+		if log.unique_id:
+			return log.unique_id
+
+		if not log.config_details:
+			return None
+
+		try:
+			initiation_log = frappe.get_doc("Bank Request Log", log.name)
+			config_details = initiation_log.decrypt_data(initiation_log.config_details)
+			if isinstance(config_details, str):
+				config_dict = json.loads(config_details)
+			elif isinstance(config_details, dict):
+				config_dict = config_details
+			else:
+				config_dict = {}
+			return config_dict.get("UNIQUEID") if isinstance(config_dict, dict) else None
+		except Exception:
+			return None
+
+	def _resolve_icici_unique_id(self, payment_details, required=False):
+		"""Same UNIQUEID used for OTP, payment, and status on single transactions."""
+		if self.bulk_transaction:
+			return "".join(re.findall(r"[0-9a-zA-Z]", payment_details.name))[-10:]
+
+		session_key = self._otp_session_key(payment_details)
+		unique_id = self._get_persisted_otp_unique_id(session_key)
+		if not unique_id:
+			unique_id = self._unique_id_from_initiation_log(session_key)
+
+		if not unique_id and required:
+			frappe.throw(
+				_(
+					"No active OTP session for Payment Order {0}. Please generate "
+					"the OTP again before initiating the payment."
+				).format(session_key)
+			)
+
+		if not unique_id:
+			unique_id = "".join(re.findall(r"[0-9a-zA-Z]", payment_details.name))
+
+		return unique_id
+
 	def set_otp_data(self, data):
 		connector_doc = self
 		payment_details = self.payment_doc if not self.bulk_transaction else self.doc
@@ -551,17 +604,8 @@ class ICICIConnector(BankConnector):
 				workflow_reqd = "Y"
 
 			# The payment MUST carry the same UNIQUEID minted at the OTP request,
-			# otherwise ICICI rejects the OTP. No silent fallback -- if the OTP
-			# session is gone, ask the user to regenerate it.
-			otp_session_key = self._otp_session_key(payment_details)
-			otp_unique_id = self._get_persisted_otp_unique_id(otp_session_key)
-			if not otp_unique_id:
-				frappe.throw(
-					_(
-						"No active OTP session for Payment Order {0}. Please generate "
-						"the OTP again before initiating the payment."
-					).format(otp_session_key)
-				)
+			# otherwise ICICI rejects the OTP.
+			otp_unique_id = self._resolve_icici_unique_id(payment_details, required=True)
 
 			data.update(
 				{
@@ -613,34 +657,7 @@ class ICICIConnector(BankConnector):
 			)
 			return
 
-		original_unique_id = "".join(re.findall(r"[0-9a-zA-Z]", payment_details.name))
-
-		initiation_logs = frappe.get_all(
-			"Bank Request Log",
-			filters={
-				"unique_id": original_unique_id,
-				"action": "Initiate Payment",
-			},
-			order_by="creation desc",
-			limit=1
-		)
-
-		if initiation_logs:
-			try:
-				initiation_log = frappe.get_doc("Bank Request Log", initiation_logs[0].name)
-				if initiation_log.config_details:
-					config_details = initiation_log.decrypt_data(initiation_log.config_details)
-					if isinstance(config_details, str):
-						config_dict = json.loads(config_details)
-					elif isinstance(config_details, dict):
-						config_dict = config_details
-					else:
-						config_dict = {}
-
-					if isinstance(config_dict, dict) and config_dict.get("UNIQUEID"):
-						original_unique_id = config_dict.get("UNIQUEID")
-			except Exception:
-				pass
+		unique_id = self._resolve_icici_unique_id(payment_details)
 
 		data.update(
 			{
@@ -648,7 +665,7 @@ class ICICIConnector(BankConnector):
 				"CORPID": connector_doc.corp_id,
 				"USERID": connector_doc.corp_usr,
 				"URN": connector_doc.urn,
-				"UNIQUEID": original_unique_id,
+				"UNIQUEID": unique_id,
 			}
 		)
 
