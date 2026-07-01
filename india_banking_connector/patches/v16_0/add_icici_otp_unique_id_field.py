@@ -16,5 +16,6 @@ def execute():
 					"insert_after": "file_sequence_number",
 				}
 			]
-		}
+		},
+		update=True,
 	)

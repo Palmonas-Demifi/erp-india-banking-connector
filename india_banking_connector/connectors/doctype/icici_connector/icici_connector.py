@@ -431,23 +431,37 @@ class ICICIConnector(BankConnector):
 
 		return payment_details.get("name")
 
+	def _otp_cache_key(self, payment_order_name):
+		return f"icici_otp_uniqueid_{payment_order_name}"
+
+	def _otp_unique_id_column_ready(self):
+		return frappe.db.has_column("Payment Order", self.ICICI_OTP_UNIQUE_ID_FIELD)
+
 	def _persist_otp_unique_id(self, payment_order_name, unique_id):
 		if not payment_order_name:
 			frappe.throw(_("Could not resolve Payment Order for ICICI OTP session."))
-		frappe.db.set_value(
-			"Payment Order",
-			payment_order_name,
-			self.ICICI_OTP_UNIQUE_ID_FIELD,
-			unique_id,
-			update_modified=False,
+		frappe.cache().set_value(
+			self._otp_cache_key(payment_order_name), unique_id, expires_in_sec=1800
 		)
+		if self._otp_unique_id_column_ready():
+			frappe.db.set_value(
+				"Payment Order",
+				payment_order_name,
+				self.ICICI_OTP_UNIQUE_ID_FIELD,
+				unique_id,
+				update_modified=False,
+			)
 
 	def _get_persisted_otp_unique_id(self, payment_order_name):
 		if not payment_order_name:
 			return None
-		return frappe.db.get_value(
-			"Payment Order", payment_order_name, self.ICICI_OTP_UNIQUE_ID_FIELD
-		)
+		if self._otp_unique_id_column_ready():
+			unique_id = frappe.db.get_value(
+				"Payment Order", payment_order_name, self.ICICI_OTP_UNIQUE_ID_FIELD
+			)
+			if unique_id:
+				return unique_id
+		return frappe.cache().get_value(self._otp_cache_key(payment_order_name))
 
 	def _mint_otp_unique_id(self, payment_order_name):
 		"""Mint UNIQUEID once per request; persist on Payment Order for payment step."""
