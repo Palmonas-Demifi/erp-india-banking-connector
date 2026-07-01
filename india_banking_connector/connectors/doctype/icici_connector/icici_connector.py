@@ -22,6 +22,7 @@ from india_banking_connector.india_banking_connector.doctype.bank_request_log.ba
 
 class ICICIConnector(BankConnector):
 	bank = "ICICI Bank"
+	ICICI_OTP_UNIQUE_ID_FIELD = "icici_otp_unique_id"
 
 	AES_KEY = "1234567887654321".encode("utf-8")
 	IV = "0000000000000000".encode("utf-8")
@@ -117,9 +118,13 @@ class ICICIConnector(BankConnector):
 	def initiate_payment(self):
 		self.update_client_details("make_payment")
 		payment_details = self.payment_doc if not self.bulk_transaction else self.doc
-		unique_id = "".join(re.findall(r"[0-9a-zA-Z]", payment_details.name))[-10:]
-		if not self.bulk_transaction:
-			unique_id = "".join(re.findall(r"[0-9a-zA-Z]", payment_details.name))
+		if self.bulk_transaction:
+			unique_id = "".join(re.findall(r"[0-9a-zA-Z]", payment_details.name))[-10:]
+		else:
+			unique_id = (
+				self._get_persisted_otp_unique_id(self._otp_session_key(payment_details))
+				or "".join(re.findall(r"[0-9a-zA-Z]", payment_details.name))
+			)
 
 		if existing_payment_response := self.validate_duplicate_payments(
 			unique_id=unique_id
@@ -128,14 +133,17 @@ class ICICIConnector(BankConnector):
 
 		url = self.urls.make_payment
 		headers = self.headers(payment_details.mode_of_transfer)
-		payload = self.get_encrypted_payload(method="make_payment")
+		account_config = self.get_account_config("make_payment")
+		payload = self.get_encrypted_payload(
+			method="make_payment", account_config=account_config
+		)
 
 		response = self.post_request(url, headers=headers, payload=payload)
 
 		log_id = create_api_log(
 			response,
 			action="Initiate Payment",
-			account_config=self.get_account_config("make_payment"),
+			account_config=account_config,
 			ref_doctype=payment_details.parenttype or payment_details.doctype,
 			ref_docname=payment_details.parent or payment_details.name,
 			unique_id=unique_id,
@@ -183,7 +191,12 @@ class ICICIConnector(BankConnector):
 		headers = self.headers(
 			payment_details.get("mode_of_transfer") or self.doc.get("default_mode_of_transfer")
 		)
-		payload = self.get_encrypted_payload(method="generate_otp")
+		# Build config once — set_otp_data mints UNIQUEID; reusing config avoids a
+		# second mint when logging (was sending one id to ICICI and storing another).
+		account_config = self.get_account_config("generate_otp")
+		payload = self.get_encrypted_payload(
+			method="generate_otp", account_config=account_config
+		)
 
 		response = self.post_request(url, headers=headers, payload=payload)
 
@@ -193,9 +206,10 @@ class ICICIConnector(BankConnector):
 		log_id = create_api_log(
 			response,
 			action="Generate OTP",
-			account_config=self.get_account_config("generate_otp"),
+			account_config=account_config,
 			ref_doctype=ref_doctype,
 			ref_docname=ref_docname,
+			unique_id=account_config.get("UNIQUEID"),
 			connector=self,
 		)
 
@@ -206,12 +220,12 @@ class ICICIConnector(BankConnector):
 	def get_priority(self, mode_of_transfer):
 		return {"RTGS": "0001", "IMPS": "0100"}.get(mode_of_transfer, "0010")
 
-	def get_encrypted_payload(self, method):
+	def get_encrypted_payload(self, method, account_config=None):
 		connector_doc = self
 
 		payment_details = self.payment_doc if not self.bulk_transaction else self.doc
 
-		data = self.get_account_config(method)
+		data = account_config or self.get_account_config(method)
 		public_key_path = self.get_file_relative_path(connector_doc.public_key)
 
 		if method in self.HYBRID_ENCRYPTION_METHODS or (
@@ -396,17 +410,8 @@ class ICICIConnector(BankConnector):
 			}
 		)
 
-	def _otp_unique_id_cache_key(self, payment_name):
-		return f"icici_otp_uniqueid_{payment_name}"
-
 	def _otp_session_key(self, payment_details):
-		"""Cache key shared by generate_otp and make_payment for one ICICI payment.
-
-		generate_otp is called with a Payment Order payload (``doc.name`` only).
-		make_payment merges a Payment Order Summary row (``name`` = summary id,
-		``parent`` = order name). Without normalising, OTP and payment look up
-		different cache keys and UNIQUEID never matches.
-		"""
+		"""Payment Order name shared by generate_otp and make_payment payloads."""
 		if self.bulk_transaction:
 			return payment_details.name
 
@@ -421,25 +426,44 @@ class ICICIConnector(BankConnector):
 		if order_name:
 			return order_name
 
+		if self.doc.get("name"):
+			return self.doc.name
+
 		return payment_details.get("name")
 
-	def regenerate_otp_unique_id(self, payment_name):
-		"""Mint and store a fresh UNIQUEID for an OTP request.
+	def _persist_otp_unique_id(self, payment_order_name, unique_id):
+		if not payment_order_name:
+			frappe.throw(_("Could not resolve Payment Order for ICICI OTP session."))
+		frappe.db.set_value(
+			"Payment Order",
+			payment_order_name,
+			self.ICICI_OTP_UNIQUE_ID_FIELD,
+			unique_id,
+			update_modified=False,
+		)
 
-		Stored for 30 min so the matching payment reuses the SAME id. Called on
-		every OTP request, so re-initiating OTP for the same payment order yields
-		a new id used for that OTP and its payment."""
+	def _get_persisted_otp_unique_id(self, payment_order_name):
+		if not payment_order_name:
+			return None
+		return frappe.db.get_value(
+			"Payment Order", payment_order_name, self.ICICI_OTP_UNIQUE_ID_FIELD
+		)
+
+	def _mint_otp_unique_id(self, payment_order_name):
+		"""Mint UNIQUEID once per request; persist on Payment Order for payment step."""
+		if (
+			getattr(self, "_request_otp_unique_id", None)
+			and getattr(self, "_request_otp_session_key", None) == payment_order_name
+		):
+			return self._request_otp_unique_id
+
 		unique_id = "".join(
 			secrets.choice("0123456789abcdefghijklmnopqrstuvwxyz") for _ in range(16)
 		)
-		frappe.cache().set_value(
-			self._otp_unique_id_cache_key(payment_name), unique_id, expires_in_sec=1800
-		)
+		self._request_otp_unique_id = unique_id
+		self._request_otp_session_key = payment_order_name
+		self._persist_otp_unique_id(payment_order_name, unique_id)
 		return unique_id
-
-	def get_otp_unique_id(self, payment_name):
-		"""The UNIQUEID minted at the most recent OTP request for this payment order."""
-		return frappe.cache().get_value(self._otp_unique_id_cache_key(payment_name))
 
 	def set_otp_data(self, data):
 		connector_doc = self
@@ -448,12 +472,7 @@ class ICICIConnector(BankConnector):
 		if self.bulk_transaction:
 			unique_id = "".join(re.findall(r"[0-9a-zA-Z]", payment_details.name))[-10:]
 		else:
-			# Every OTP request mints a fresh UNIQUEID and stores it, so the
-			# matching payment sends the SAME id. Re-initiating OTP for the same
-			# payment order overwrites it -> a new id for that OTP and its payment.
-			unique_id = self.regenerate_otp_unique_id(
-				self._otp_session_key(payment_details)
-			)
+			unique_id = self._mint_otp_unique_id(self._otp_session_key(payment_details))
 
 		data.update(
 			{
@@ -521,7 +540,7 @@ class ICICIConnector(BankConnector):
 			# otherwise ICICI rejects the OTP. No silent fallback -- if the OTP
 			# session is gone, ask the user to regenerate it.
 			otp_session_key = self._otp_session_key(payment_details)
-			otp_unique_id = self.get_otp_unique_id(otp_session_key)
+			otp_unique_id = self._get_persisted_otp_unique_id(otp_session_key)
 			if not otp_unique_id:
 				frappe.throw(
 					_(
