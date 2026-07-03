@@ -505,15 +505,12 @@ class ICICIConnector(BankConnector):
 				config_dict = config_details
 			else:
 				config_dict = {}
-			return config_dict.get("UNIQUEID") if isinstance(config_dict, dict) else None
+			return config_dict.get("UNIQUEID") or config_dict.get("UNIQUE_ID") if isinstance(config_dict, dict) else None
 		except Exception:
 			return None
 
 	def _resolve_icici_unique_id(self, payment_details, required=False):
-		"""Same UNIQUEID used for OTP, payment, and status on single transactions."""
-		if self.bulk_transaction:
-			return "".join(re.findall(r"[0-9a-zA-Z]", payment_details.name))[-10:]
-
+		"""Same UNIQUEID for OTP, payment, and status (composite and bulk)."""
 		session_key = self._otp_session_key(payment_details)
 		unique_id = self._get_persisted_otp_unique_id(session_key)
 		if not unique_id:
@@ -528,7 +525,10 @@ class ICICIConnector(BankConnector):
 			)
 
 		if not unique_id:
-			unique_id = "".join(re.findall(r"[0-9a-zA-Z]", payment_details.name))
+			payment_name = payment_details.get("name") or getattr(
+				payment_details, "name", ""
+			)
+			unique_id = "".join(re.findall(r"[0-9a-zA-Z]", payment_name))
 
 		return unique_id
 
@@ -536,10 +536,7 @@ class ICICIConnector(BankConnector):
 		connector_doc = self
 		payment_details = self.payment_doc if not self.bulk_transaction else self.doc
 
-		if self.bulk_transaction:
-			unique_id = "".join(re.findall(r"[0-9a-zA-Z]", payment_details.name))[-10:]
-		else:
-			unique_id = self._mint_otp_unique_id(self._otp_session_key(payment_details))
+		unique_id = self._mint_otp_unique_id(self._otp_session_key(payment_details))
 
 		data.update(
 			{
@@ -576,9 +573,9 @@ class ICICIConnector(BankConnector):
 			-10:
 		]
 
-		unique_id = "".join(re.findall(r"[0-9a-zA-Z]", payment_details.name))[-10:]
-
 		if self.bulk_transaction:
+			# Same persisted UNIQUEID as OTP; file name/description stay PO-based.
+			unique_id = self._resolve_icici_unique_id(payment_details, required=True)
 			data.update(
 				{
 					"FILE_DESCRIPTION": file_reference_id,
@@ -640,7 +637,7 @@ class ICICIConnector(BankConnector):
 	def set_payment_status_data(self, data):
 		connector_doc = self
 		payment_details = self.payment_doc if not self.bulk_transaction else self.doc
-		unique_id = "".join(re.findall(r"[0-9a-zA-Z]", payment_details.name))[-10:]
+		unique_id = self._resolve_icici_unique_id(payment_details)
 
 		if self.bulk_transaction:
 			payment_doc = self.doc
@@ -656,8 +653,6 @@ class ICICIConnector(BankConnector):
 				}
 			)
 			return
-
-		unique_id = self._resolve_icici_unique_id(payment_details)
 
 		data.update(
 			{
