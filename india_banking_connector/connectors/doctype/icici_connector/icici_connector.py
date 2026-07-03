@@ -405,9 +405,46 @@ class ICICIConnector(BankConnector):
 			}
 		)
 
+	def _payment_order_doc(self):
+		doc = self.doc or {}
+		return frappe._dict(doc) if isinstance(doc, dict) else doc
+
+	def _uses_bulk_file_status_inquiry(self):
+		"""Bulk file status needs FILESEQNUM; composite-initiated POs do not have it."""
+		if not self.bulk_transaction:
+			return False
+		po = self._payment_order_doc()
+		return bool(po.get("file_sequence_number"))
+
+	def _payment_status_summary_key(self):
+		"""Summary row id for mapping composite status responses."""
+		row_name = getattr(self.payment_doc, "name", None)
+		if not row_name and hasattr(self.payment_doc, "get"):
+			row_name = self.payment_doc.get("name")
+		if row_name:
+			return row_name
+
+		po = self._payment_order_doc()
+		for row in po.get("summary") or []:
+			row = frappe._dict(row)
+			if row.payment_initiated or row.payment_status in (
+				"Initiated",
+				"Processed",
+				"Pending",
+			):
+				return row.name
+
+		summary = po.get("summary") or []
+		if summary:
+			return frappe._dict(summary[0]).name
+
+		return po.get("name")
+
 	def _otp_session_key(self, payment_details):
 		"""Payment Order name shared by generate_otp and make_payment payloads."""
 		if self.bulk_transaction:
+			if hasattr(payment_details, "get"):
+				return payment_details.get("name") or self._payment_order_doc().get("name")
 			return payment_details.name
 
 		if (
@@ -639,8 +676,8 @@ class ICICIConnector(BankConnector):
 		payment_details = self.payment_doc if not self.bulk_transaction else self.doc
 		unique_id = self._resolve_icici_unique_id(payment_details)
 
-		if self.bulk_transaction:
-			payment_doc = self.doc
+		if self._uses_bulk_file_status_inquiry():
+			po = self._payment_order_doc()
 			data.update(
 				{
 					"CORPID": connector_doc.corp_id,
@@ -648,12 +685,13 @@ class ICICIConnector(BankConnector):
 					"AGGRID": connector_doc.aggr_id,
 					"URN": connector_doc.urn,
 					"UNIQUEID": unique_id,
-					"FILESEQNUM": payment_doc.file_sequence_number,
+					"FILESEQNUM": po.get("file_sequence_number"),
 					"ISENCRYPTED": "N",
 				}
 			)
 			return
 
+		# Composite / single-transaction status (no FILESEQNUM).
 		data.update(
 			{
 				"AGGRID": connector_doc.aggr_id,
@@ -732,7 +770,11 @@ class ICICIConnector(BankConnector):
 
 		data = frappe._dict(data)
 
-		if self.bulk_transaction or method in ["bank_balance", "bank_statement"]:
+		use_bulk_handler = method in ["bank_balance", "bank_statement"] or (
+			self.bulk_transaction
+			and not (method == "payment_status" and not self._uses_bulk_file_status_inquiry())
+		)
+		if use_bulk_handler:
 			self.handle_bulk_transaction_response(data, res_dict, method)
 			return res_dict
 
@@ -807,10 +849,11 @@ class ICICIConnector(BankConnector):
 					res_dict.message = f"Invalid Status : {data.STATUS}"
 
 		elif method == "payment_status" and data:
+			summary_key = self._payment_status_summary_key()
 			if data.STATUS == "SUCCESS":
 				res_dict.payment_status = "PROCESSED"
 				res_dict.summary_details = {
-					self.payment_doc.name: {
+					summary_key: {
 						"status": "Processed",
 						"utr_number": data.UTRNUMBER,
 						"message": data.MESSAGE or "Payment Completed",
@@ -819,7 +862,7 @@ class ICICIConnector(BankConnector):
 			elif data.STATUS in ["PENDING", "PENDING FOR APPROVAL"]:
 				res_dict.payment_status = "PROCESSED"
 				res_dict.summary_details = {
-					self.payment_doc.name: {
+					summary_key: {
 						"status": "Pending",
 						"message": data.MESSAGE or "Payment Pending",
 					}
@@ -827,7 +870,7 @@ class ICICIConnector(BankConnector):
 			elif data.STATUS == "FAILURE":
 				res_dict.payment_status = "PROCESSED"
 				res_dict.summary_details = {
-					self.payment_doc.name: {
+					summary_key: {
 						"status": "Failed",
 						"message": data.MESSAGE or "Payment Failed",
 					}
@@ -835,7 +878,7 @@ class ICICIConnector(BankConnector):
 			else:
 				res_dict.payment_status = "PROCESSED"
 				res_dict.summary_details = {
-					self.payment_doc.name: {
+					summary_key: {
 						"status": "Request Failure",
 						"message": data.MESSAGE or "Payment Request Failure",
 					}
